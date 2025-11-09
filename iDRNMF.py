@@ -1,80 +1,192 @@
-import torch
+import os
+import warnings
 import numpy as np
+import torch
+import scipy.io
 
-def iDRNMF(X, r, e21, e22, e2cauchy, iteration=300, gamma=1, eps=1e-6):
+# ---------------------------
+# Environment and constants
+# ---------------------------
+warnings.filterwarnings("ignore")
+EPS = 1e-10  # numerical stability
+DEVICE = torch.device("cpu")  # or "cuda" if GPU available
+
+
+def set_seed(seed=0):
+    """Reproducibility."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+# ---------------------------
+# NMF primitives
+# ---------------------------
+def multiplicative_update_W_H(X, W, H, D_diag):
     
-    """
-    Args:
-        X (torch.Tensor): Input data matrix of shape (d, n).
-        r (int): Number of clusters (rank).
-        e21 (float): Normalization constant for 2,1 loss.
-        e22 (float): Normalization constant for 2,2 (Frobenious) loss.
-        e2cauchy (float): Normalization constant for 2,cauchy loss.
-        iteration (int): Number of iterations (default 300).
-        gamma (float): Parameter for Cauchy loss (default 1).
-        eps (float): Small epsilon to avoid division by zero (default 1e-6).
+    D_row = D_diag.unsqueeze(0)  
+    
+    X_D = X * D_row
+    H_D = H * D_row
 
-    Returns:
-        W (torch.Tensor): Basis matrix of shape (d, r).
-        H (torch.Tensor): Coefficient matrix of shape (r, n).
-    """
+    # Update W
+    W *= (X_D @ H.t()) / (W @ (H @ H_D.t()) + EPS)
 
-    d, n = X.shape
+    # Update H
+    WT = W.t()
+    H *= (WT @ X_D) / ((WT @ W) @ (H * D_row) + EPS)
 
-    # Initialize W and H randomly
-    W = torch.rand(d, r)
-    H = torch.rand(r, n)
-
-    lossFunctions = ["2,1", "2,2", "2,cauchy"]
-    lossFuncWeight = [1, 1, 1]
-    eNormalization = [e21, e22, e2cauchy]
-
-    lossFuncCount = len(lossFuncWeight)
-    nonZeroInd = np.nonzero(lossFuncWeight)[0]
-    lossCount = len(nonZeroInd)
-
-    lam = [lossFuncWeight[i] / lossCount for i in range(lossFuncCount)]
-
-    for i in range(iteration):
-
-        # Compute residual norms per column
-        e = torch.norm(X - W @ H, dim=0)
-
-        d21 = 1 / torch.maximum(e, torch.tensor(eps))
-        d22 = torch.ones(n)
-        d2cauchy = 1 / torch.maximum(e**2 + gamma**2, torch.tensor(eps))
-        dAll = [d21, d22, d2cauchy]
-
-        dFinal = torch.zeros(n)
-
-        for j in range(lossFuncCount):
-            dFinal += (lossFuncWeight[j] * lam[j] / eNormalization[j]) * dAll[j]
-
-        D = torch.diag(dFinal)
-
-        # Update W
-        Wu = X @ D @ H.T
-        Wd = W @ H @ D @ H.T
-        W = W * (Wu / torch.maximum(Wd, torch.tensor(eps)))
-
-        # Update H
-        Hu = W.T @ X @ D
-        Hd = W.T @ W @ H @ D
-        H = H * (Hu / torch.maximum(Hd, torch.tensor(eps)))
-
-        # Compute each loss component
-        e21_val = lossFuncWeight[0] * (torch.sum(torch.norm(X - W @ H, dim=0))) / eNormalization[0]
-        e22_val = lossFuncWeight[1] * (torch.norm(X - W @ H)**2) / eNormalization[1]
-        e2cauchy_val = lossFuncWeight[2] * (torch.sum(torch.log(torch.norm(X - W @ H, dim=0)**2 + gamma**2))) / eNormalization[2]
-
-        eFinal = [e21_val.item(), e22_val.item(), e2cauchy_val.item()]
-
-        omega = 1 / (i + 2)
-        lamStar = [0] * lossFuncCount
-        maxIndex = eFinal.index(max(eFinal))
-        lamStar[maxIndex] = 1
-
-        for j in range(lossFuncCount):
-            lam[j] = (1 - omega) * lam[j] + omega * lamStar[j]
-
+    W.clamp_(min=0.0)
+    H.clamp_(min=0.0)
     return W, H
+
+
+def compute_instance_residuals(X, W, H):
+    return torch.norm(X - W @ H, dim=0)
+
+
+
+def pure_nmf_2_2(X, W, H, max_iter=100):
+    for _ in range(max_iter):
+        W *= (X @ H.t()) / (W @ (H @ H.t()) + EPS)
+        H *= (W.t() @ X) / ((W.t() @ W) @ H + EPS)
+    return W, H, torch.norm(X - W @ H) ** 2
+
+
+def pure_nmf_2_1(X, W, H, max_iter=100):
+    for _ in range(max_iter):
+        e = compute_instance_residuals(X, W, H)
+        D = 1.0 / torch.maximum(e, torch.tensor(EPS, device=DEVICE))
+        W, H = multiplicative_update_W_H(X, W, H, D)
+    return W, H, torch.sum(torch.norm(X - W @ H, dim=0))
+
+
+def pure_nmf_cauchy(X, W, H, gamma=1.0, max_iter=100):
+    for _ in range(max_iter):
+        e = compute_instance_residuals(X, W, H)
+        D = 1.0 / (e ** 2 + gamma ** 2)
+        W, H = multiplicative_update_W_H(X, W, H, D)
+    loss = torch.sum(torch.log(torch.norm(X - W @ H, dim=0) ** 2 + gamma ** 2))
+    return W, H, loss
+
+
+# ---------------------------
+# Main iDRNMF algorithm
+# ---------------------------
+def idrnmf(X, n_components,
+           max_iter=300, gamma=1.0,
+           eta0=0.9, eta_final=0.01,
+           compute_zeta_iter=100,
+           init_seed=0,
+           normalize_columns=True,
+           early_stop_tol=1e-6,
+           verbose=True):
+    
+    set_seed(init_seed)
+    m, n = X.shape
+
+    # Optional column normalization
+    if normalize_columns:
+        X = X / (torch.norm(X, dim=0, keepdim=True) + EPS)
+
+    # Initialization
+    W = torch.rand(m, n_components, device=DEVICE)
+    H = torch.rand(n_components, n, device=DEVICE)
+
+    # Compute normalization constants (ζτ)
+    if verbose:
+        print("Computing normalization constants (ζ)...")
+    _, _, z21 = pure_nmf_2_1(X, W.clone(), H.clone(), compute_zeta_iter)
+    _, _, z22 = pure_nmf_2_2(X, W.clone(), H.clone(), compute_zeta_iter)
+    _, _, zcau = pure_nmf_cauchy(X, W.clone(), H.clone(), gamma, compute_zeta_iter)
+    z21, z22, zcau = [float(z.item()) for z in [z21, z22, zcau]]
+
+    if verbose:
+        print(f"ζ21={z21:.3e}, ζ22={z22:.3e}, ζcau={zcau:.3e}")
+
+    # Initialize parameters
+    lam = torch.ones(3, device=DEVICE) / 3.0
+    eps21, eps22, epsc = 1 / z21, 1 / z22, 1 / zcau
+
+    def eta(t): return eta0 + (eta_final - eta0) * (t / max_iter)
+
+    prev_obj = None
+    for t in range(max_iter):
+        e = compute_instance_residuals(X, W, H)
+        d1 = 1 / (e + EPS)
+        d2 = torch.ones_like(e)
+        dc = 1 / (e ** 2 + gamma ** 2)
+        D = lam[0] * eps21 * d1 + lam[1] * eps22 * d2 + lam[2] * epsc * dc
+        W, H = multiplicative_update_W_H(X, W, H, D)
+
+        # Compute loss components
+        e = compute_instance_residuals(X, W, H)
+        L1 = torch.sum(e).item() * eps21
+        L2 = torch.norm(X - W @ H).pow(2).item() * eps22
+        Lc = torch.sum(torch.log(e ** 2 + gamma ** 2)).item() * epsc
+        losses = np.array([L1, L2, Lc])
+        obj = float(np.sum(lam.cpu().numpy() * losses))
+
+        if prev_obj and abs(prev_obj - obj) < early_stop_tol:
+            if verbose:
+                print(f"Converged at iter {t+1}, Δobj={abs(prev_obj - obj):.2e}")
+            break
+        prev_obj = obj
+
+        # Update λ 
+        j = np.argmax(losses)
+        lam_star = torch.zeros_like(lam)
+        lam_star[j] = 1.0
+        lam = (1 - eta(t)) * lam + eta(t) * lam_star
+        lam /= lam.sum()
+
+        if verbose and (t % 10 == 0 or t == max_iter - 1):
+            print(f"Iter {t+1:03d} | Obj={obj:.3e} | λ={lam.cpu().numpy()}")
+
+    if verbose:
+        print("Optimization finished.\n")
+    return W, H
+
+
+# ---------------------------
+# Script entry
+# ---------------------------
+if __name__ == "__main__":
+    # === Load dataset ===
+    mat_path = "D://MNIST.mat"  # ← EDIT your dataset path
+    if not os.path.exists(mat_path):
+        raise FileNotFoundError(f"Dataset not found: {mat_path}")
+
+    mat = scipy.io.loadmat(mat_path)
+    X_np = mat["X"]
+    y_np = mat["y"].flatten().astype(int)
+
+    # Ensure X has shape (features × samples)
+    if X_np.shape[0] == len(y_np):
+        X_np = X_np.T
+    elif X_np.shape[0] < X_np.shape[1]:
+        X_np = X_np.T
+
+    print(f"Loaded X shape: {X_np.shape} (features × samples)")
+
+    # Convert to torch tensor
+    X = torch.tensor(X_np, dtype=torch.float32, device=DEVICE)
+
+    # === Run iDRNMF ===
+    r = len(np.unique(y_np))
+    W, H = idrnmf(
+        X,
+        n_components=r,
+        max_iter=300,
+        gamma=1.0,
+        eta0=0.9,
+        eta_final=0.05,
+        compute_zeta_iter=100,
+        init_seed=0,
+        normalize_columns=True,
+        early_stop_tol=1e-7,
+        verbose=True
+    )
+
+    # Optional: save factorization
+    # torch.save(W, "W_idrnmf.pt")
+    # torch.save(H, "H_idrnmf.pt")
